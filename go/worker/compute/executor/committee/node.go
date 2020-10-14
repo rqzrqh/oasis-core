@@ -353,6 +353,7 @@ func (n *Node) queueBatchBlocking(
 		Version:   1,
 		Namespace: hdr.Namespace,
 		Round:     hdr.Round + 1,
+		RootTypes: []storage.RootType{storage.RootTypeIO},
 		Roots:     []hash.Hash{ioRootHash},
 	}
 	if !signature.VerifyManyToOne(storage.ReceiptSignatureContext, cbor.Marshal(receiptBody), storageSignatures) {
@@ -365,6 +366,7 @@ func (n *Node) queueBatchBlocking(
 		ioRoot: storage.Root{
 			Namespace: hdr.Namespace,
 			Version:   hdr.Round + 1,
+			Type:      storage.RootTypeIO,
 			Hash:      ioRootHash,
 		},
 		txnSchedSignature: txnSchedSig,
@@ -394,6 +396,7 @@ func (n *Node) handleInternalBatchLocked(
 		ioRoot: storage.Root{
 			Namespace: n.commonNode.CurrentBlock.Header.Namespace,
 			Version:   n.commonNode.CurrentBlock.Header.Round + 1,
+			Type:      storage.RootTypeIO,
 			Hash:      ioRoot,
 		},
 		txnSchedSignature: txnSchedSig,
@@ -828,6 +831,7 @@ func (n *Node) handleScheduleBatch(force bool) {
 	emptyRoot := storage.Root{
 		Namespace: lastHeader.Namespace,
 		Version:   lastHeader.Round + 1,
+		Type:      storage.RootTypeIO,
 	}
 	emptyRoot.Hash.Empty()
 
@@ -858,6 +862,7 @@ func (n *Node) handleScheduleBatch(force bool) {
 
 	ioReceipts, err := n.commonNode.Group.Storage().Apply(ctx, &storage.ApplyRequest{
 		Namespace: lastHeader.Namespace,
+		RootType:  storage.RootTypeIO,
 		SrcRound:  lastHeader.Round + 1,
 		SrcRoot:   emptyRoot.Hash,
 		DstRound:  lastHeader.Round + 1,
@@ -1168,6 +1173,7 @@ func (n *Node) proposeBatchLocked(processedBatch *processedBatch) {
 		applyOps := []storage.ApplyOp{
 			// I/O root.
 			{
+				RootType: storage.RootTypeIO,
 				SrcRound: lastHeader.Round + 1,
 				SrcRoot:  state.batch.ioRoot.Hash,
 				DstRoot:  *batch.Header.IORoot,
@@ -1175,6 +1181,7 @@ func (n *Node) proposeBatchLocked(processedBatch *processedBatch) {
 			},
 			// State root.
 			{
+				RootType: storage.RootTypeState,
 				SrcRound: lastHeader.Round,
 				SrcRoot:  lastHeader.StateRoot,
 				DstRoot:  *batch.Header.StateRoot,
