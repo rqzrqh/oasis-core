@@ -60,26 +60,7 @@ func (cc *checkerCommon) checkNodes(root node.Root) error {
 	return nil
 }
 
-// CheckSanity checks the sanity of the node database by traversing all stored trees.
-func CheckSanity(ctx context.Context, cfg *api.Config, display DisplayHelper) error {
-	db := &badgerNodeDB{
-		logger:           logging.GetLogger("mkvs/db/badger/migrate"),
-		namespace:        cfg.Namespace,
-		discardWriteLogs: cfg.DiscardWriteLogs,
-	}
-	roCfg := *cfg
-	roCfg.ReadOnly = true
-	opts := commonConfigToBadgerOptions(&roCfg, db)
-
-	var err error
-	if db.db, err = badger.OpenManaged(opts); err != nil {
-		return fmt.Errorf("mkvs/badger/check: failed to open database: %w", err)
-	}
-	defer db.Close()
-
-	// Make sure that we can discard any deleted/invalid metadata.
-	db.db.SetDiscardTs(tsMetadata)
-
+func checkSanityInternal(ctx context.Context, db *badgerNodeDB, display DisplayHelper) error {
 	txn := db.db.NewTransactionAt(maxTimestamp, false)
 	defer txn.Discard()
 
@@ -152,7 +133,7 @@ func CheckSanity(ctx context.Context, cfg *api.Config, display DisplayHelper) er
 
 		for rootHash := range rootsMeta.Roots {
 			root := node.Root{
-				Namespace: cfg.Namespace,
+				Namespace: db.namespace,
 				Version:   version,
 				Type:      rootHash.Type(),
 				Hash:      rootHash.Hash(),
@@ -167,4 +148,27 @@ func CheckSanity(ctx context.Context, cfg *api.Config, display DisplayHelper) er
 	}
 
 	return nil
+}
+
+// CheckSanity checks the sanity of the node database by traversing all stored trees.
+func CheckSanity(ctx context.Context, cfg *api.Config, display DisplayHelper) error {
+	db := &badgerNodeDB{
+		logger:           logging.GetLogger("mkvs/db/badger/migrate"),
+		namespace:        cfg.Namespace,
+		discardWriteLogs: cfg.DiscardWriteLogs,
+	}
+	roCfg := *cfg
+	roCfg.ReadOnly = true
+	opts := commonConfigToBadgerOptions(&roCfg, db)
+
+	var err error
+	if db.db, err = badger.OpenManaged(opts); err != nil {
+		return fmt.Errorf("mkvs/badger/check: failed to open database: %w", err)
+	}
+	defer db.Close()
+
+	// Make sure that we can discard any deleted/invalid metadata.
+	db.db.SetDiscardTs(tsMetadata)
+
+	return checkSanityInternal(ctx, db, display)
 }

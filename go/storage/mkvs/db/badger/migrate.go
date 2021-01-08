@@ -1,6 +1,7 @@
 package badger
 
 import (
+	"bytes"
 	"fmt"
 	"math"
 
@@ -87,7 +88,7 @@ type DisplayHelper interface {
 
 type MigrationHelper interface {
 	DisplayHelper
-	GetRootForHash(root hash.Hash, version uint64) (*node.Root, error)
+	GetRootForHash(root hash.Hash, version uint64) ([]node.Root, error)
 }
 
 type migration interface {
@@ -110,6 +111,7 @@ type v4MigratorMetadata struct {
 
 	MultipartActive bool   `json:"multipart_active"`
 	LastKey         []byte `json:"last_key"`
+	LastKeyVersion  uint64 `json:"last_key_version"`
 
 	MetaCount        uint64 `json:"meta_count"`
 	CurrentMetaCount uint64 `json:"current_meta_count"`
@@ -174,32 +176,41 @@ func (v4 *v4Migrator) flush(force bool) error {
 }
 
 // This is only usable once rootsMetadataKeyFmt keys have been migrated!
-func (v4 *v4Migrator) getRootType(rh hash.Hash, version uint64) (node.RootType, error) {
-	root, err := v4.helper.GetRootForHash(rh, version)
-	if err == nil && root != nil {
-		return root.Type, nil
+func (v4 *v4Migrator) getRootType(rh hash.Hash, version uint64) ([]node.RootType, error) {
+	roots, err := v4.helper.GetRootForHash(rh, version)
+	if err == nil && len(roots) > 0 {
+		rootTypes := make([]node.RootType, len(roots))
+		for i, root := range roots {
+			rootTypes[i] = root.Type
+		}
+		return rootTypes, nil
 	}
 
 	// If not directly discoverable, try traversing finalized roots metadata.
 	meta, err := loadRootsMetadata(v4.readTxn, version)
 	if err != nil {
-		return node.RootTypeInvalid, err
+		return nil, err
 	}
 
+	found := map[node.RootType]struct{}{}
 	for root, chain := range meta.Roots {
 		h := root.Hash()
 		if h.Equal(&rh) {
-			return root.Type(), nil
+			found[root.Type()] = struct{}{}
 		}
 		for _, droot := range chain {
 			h := droot.Hash()
 			if h.Equal(&rh) {
-				return droot.Type(), nil
+				found[droot.Type()] = struct{}{}
 			}
 		}
 	}
+	ret := make([]node.RootType, 0, len(found))
+	for typ := range found {
+		ret = append(ret, typ)
+	}
 
-	return node.RootTypeInvalid, nil
+	return ret, nil
 }
 
 func (v4 *v4Migrator) keyMetadata(item *badger.Item) error {
@@ -226,7 +237,12 @@ func (v4 *v4Migrator) keyMetadata(item *badger.Item) error {
 	return nil
 }
 
-func (v4 *v4Migrator) keyRootsMetadata(item *badger.Item) error {
+func (v4 *v4Migrator) keyRootsMetadata(item *badger.Item) error { // nolint: gocyclo
+	if item.IsDeletedOrExpired() {
+		// Roots metadata keys are always at tsMetadata.
+		return nil
+	}
+
 	var version uint64
 	if !v3RootsMetadataKeyFmt.Decode(item.Key(), &version) {
 		return fmt.Errorf("error decoding roots metadata key")
@@ -241,23 +257,22 @@ func (v4 *v4Migrator) keyRootsMetadata(item *badger.Item) error {
 	}
 
 	// Propagate type information throughout the derived root chains.
-	plainRoots := map[hash.Hash]node.RootType{}
+	plainRoots := map[hash.Hash]map[node.RootType]struct{}{}
 	for root, chain := range rootsMeta.Roots {
-		plainRoots[root] = node.RootTypeInvalid
+		plainRoots[root] = map[node.RootType]struct{}{}
 		for _, droot := range chain {
-			plainRoots[droot] = node.RootTypeInvalid
+			plainRoots[droot] = map[node.RootType]struct{}{}
 		}
 	}
 
 	remaining := len(plainRoots)
-	for root, typ := range plainRoots {
-		if typ != node.RootTypeInvalid {
-			continue
-		}
-		var full *node.Root
+	for root := range plainRoots {
+		var full []node.Root
 		full, err = v4.helper.GetRootForHash(root, version)
-		if err == nil && full != nil {
-			plainRoots[root] = full.Type
+		if err == nil && len(full) > 0 {
+			for _, r := range full {
+				plainRoots[root][r.Type] = struct{}{}
+			}
 			remaining--
 		}
 		if err != nil && err != ErrVersionNotFound {
@@ -269,19 +284,20 @@ func (v4 *v4Migrator) keyRootsMetadata(item *badger.Item) error {
 	for remaining > 0 {
 		preLoop := remaining
 		for root, chain := range rootsMeta.Roots {
-			typ := node.RootTypeInvalid
+			types := map[node.RootType]struct{}{}
 			all := append([]hash.Hash{root}, chain...)
 			for _, droot := range all {
-				if dtype, ok := plainRoots[droot]; ok && dtype != node.RootTypeInvalid {
-					typ = dtype
-					break
+				if dtypes, ok := plainRoots[droot]; ok && len(dtypes) > 0 {
+					for typ := range dtypes {
+						types[typ] = struct{}{}
+					}
 				}
 			}
 
-			if typ != node.RootTypeInvalid {
+			if len(types) > 0 {
 				for _, root := range all {
-					if plainRoots[root] == node.RootTypeInvalid {
-						plainRoots[root] = typ
+					if len(plainRoots[root]) == 0 {
+						plainRoots[root] = types
 						remaining--
 					}
 				}
@@ -300,14 +316,16 @@ func (v4 *v4Migrator) keyRootsMetadata(item *badger.Item) error {
 	}
 
 	// Create root typing keys.
-	for h, t := range plainRoots {
-		th := typedHashFromParts(t, h)
-		entry := badger.NewEntry(
-			v4RootNodeKeyFmt.Encode(&th),
-			[]byte{},
-		)
-		if err = v4.changeBatch.SetEntryAt(entry, versionToTs(version)); err != nil {
-			return fmt.Errorf("error creating root typing key: %w", err)
+	for h, types := range plainRoots {
+		for t := range types {
+			th := typedHashFromParts(t, h)
+			entry := badger.NewEntry(
+				v4RootNodeKeyFmt.Encode(&th),
+				[]byte{},
+			)
+			if err = v4.changeBatch.SetEntryAt(entry, versionToTs(version)); err != nil {
+				return fmt.Errorf("error creating root typing key: %w", err)
+			}
 		}
 	}
 
@@ -315,13 +333,15 @@ func (v4 *v4Migrator) keyRootsMetadata(item *badger.Item) error {
 	var newRoots v4RootsMetadata
 	newRoots.Roots = map[typedHash][]typedHash{}
 	for root, chain := range rootsMeta.Roots {
-		arr := make([]typedHash, 0, len(chain))
-		for _, droot := range chain {
-			th := typedHashFromParts(plainRoots[droot], droot)
-			arr = append(arr, th)
+		for typ := range plainRoots[root] {
+			arr := make([]typedHash, 0, len(chain))
+			for _, droot := range chain {
+				th := typedHashFromParts(typ, droot)
+				arr = append(arr, th)
+			}
+			th := typedHashFromParts(typ, root)
+			newRoots.Roots[th] = arr
 		}
-		th := typedHashFromParts(plainRoots[root], root)
-		newRoots.Roots[th] = arr
 	}
 
 	err = v4.changeBatch.DeleteAt(item.KeyCopy(nil), item.Version())
@@ -344,17 +364,11 @@ func (v4 *v4Migrator) keyWriteLog(item *badger.Item) error {
 		return fmt.Errorf("error decoding writelog key")
 	}
 
-	var val []byte
-	_ = item.Value(func(data []byte) error {
-		val = data
-		return nil
-	})
-
-	t1, err := v4.getRootType(h1, version)
+	types, err := v4.getRootType(h1, version)
 	if err != nil {
 		return fmt.Errorf("error getting type for writelog root %v:%v: %w", h1, version, err)
 	}
-	if t1 == node.RootTypeInvalid {
+	if len(types) == 0 {
 		// Root doesn't exist anymore, so this writelog is probably stale
 		// and shouldn't exist anymore.
 		err = v4.changeBatch.DeleteAt(item.KeyCopy(nil), item.Version())
@@ -363,17 +377,35 @@ func (v4 *v4Migrator) keyWriteLog(item *badger.Item) error {
 		}
 		return nil
 	}
-	th1.FromParts(t1, h1)
-	th2.FromParts(t1, h2)
 
 	err = v4.changeBatch.DeleteAt(item.KeyCopy(nil), item.Version())
 	if err != nil {
 		return fmt.Errorf("error removing old writelog key: %w", err)
 	}
-	entry := badger.NewEntry(v4WriteLogKeyFmt.Encode(&version, &th1, &th2), val)
-	err = v4.changeBatch.SetEntryAt(entry, item.Version())
-	if err != nil {
-		return fmt.Errorf("error setting updated writelog key: %w", err)
+
+	var val []byte
+	_ = item.Value(func(data []byte) error {
+		val = data
+		return nil
+	})
+
+	for _, t1 := range types {
+		th1.FromParts(t1, h1)
+		th2.FromParts(t1, h2)
+		key := v4WriteLogKeyFmt.Encode(&version, &th1, &th2)
+
+		if item.IsDeletedOrExpired() {
+			err = v4.changeBatch.DeleteAt(key, item.Version())
+			if err != nil {
+				return fmt.Errorf("error setting removed flag for writelog key: %w", err)
+			}
+		} else {
+			entry := badger.NewEntry(key, val)
+			err = v4.changeBatch.SetEntryAt(entry, item.Version())
+			if err != nil {
+				return fmt.Errorf("error setting updated writelog key: %w", err)
+			}
+		}
 	}
 
 	return nil
@@ -386,35 +418,31 @@ func (v4 *v4Migrator) keyRootUpdatedNodes(item *badger.Item) error {
 		return fmt.Errorf("error decoding root updated nodes key")
 	}
 
+	types, err := v4.getRootType(h1, version)
+	if err != nil || len(types) == 0 {
+		return fmt.Errorf("error getting root %v:%v for updated nodes list: %w", h1, version, err)
+	}
+	err = v4.changeBatch.DeleteAt(item.KeyCopy(nil), item.Version())
+	if err != nil {
+		return fmt.Errorf("error deleting old nodes nodes list for root %v: %w", h1, err)
+	}
+	if item.IsDeletedOrExpired() {
+		for _, typ := range types {
+			th := typedHashFromParts(typ, h1)
+			key := v4RootUpdatedNodesKeyFmt.Encode(version, &th)
+			if err = v4.changeBatch.DeleteAt(key, item.Version()); err != nil {
+				return fmt.Errorf("error transforming removed updated nodes list for root %v: %w", th, err)
+			}
+		}
+		return nil
+	}
+
 	var oldUpdatedNodes []v3UpdatedNode
-	err := item.Value(func(data []byte) error {
+	err = item.Value(func(data []byte) error {
 		return cbor.UnmarshalTrusted(data, &oldUpdatedNodes)
 	})
 	if err != nil {
 		return fmt.Errorf("error decoding updated nodes list for root %v:%v: %w", h1, version, err)
-	}
-
-	typ, err := v4.getRootType(h1, version)
-	if err != nil || typ == node.RootTypeInvalid {
-		return fmt.Errorf("error getting root %v:%v for updated nodes list: %w", h1, version, err)
-	}
-	th := typedHashFromParts(typ, h1)
-
-	if v4.meta.MultipartActive {
-		entry := badger.NewEntry(
-			v4MultipartRestoreNodeLogKeyFmt.Encode(&th),
-			[]byte{},
-		)
-		if err = v4.changeBatch.SetEntryAt(entry, versionToTs(version)); err != nil {
-			return fmt.Errorf("error setting multipart marker for root %v: %w", th, err)
-		}
-	}
-	rootEntry := badger.NewEntry(
-		rootNodeKeyFmt.Encode(&th),
-		[]byte{},
-	)
-	if err = v4.changeBatch.SetEntryAt(rootEntry, versionToTs(version)); err != nil {
-		return fmt.Errorf("error setting root marker for root %v: %w", th, err)
 	}
 
 	newUpdatedNodes := make([]v4UpdatedNode, 0, len(oldUpdatedNodes))
@@ -425,23 +453,45 @@ func (v4 *v4Migrator) keyRootUpdatedNodes(item *badger.Item) error {
 		})
 	}
 
-	err = v4.changeBatch.DeleteAt(item.KeyCopy(nil), item.Version())
-	if err != nil {
-		return fmt.Errorf("error deleting old nodes nodes list for root %v: %w", th, err)
-	}
-	entry := badger.NewEntry(
-		v4RootUpdatedNodesKeyFmt.Encode(version, &th),
-		cbor.Marshal(newUpdatedNodes),
-	)
-	err = v4.changeBatch.SetEntryAt(entry, item.Version())
-	if err != nil {
-		return fmt.Errorf("error storing updated nodes list for root %v: %w", th, err)
+	for _, typ := range types {
+		th := typedHashFromParts(typ, h1)
+
+		if v4.meta.MultipartActive {
+			entry := badger.NewEntry(
+				v4MultipartRestoreNodeLogKeyFmt.Encode(&th),
+				[]byte{},
+			)
+			if err = v4.changeBatch.SetEntryAt(entry, versionToTs(version)); err != nil {
+				return fmt.Errorf("error setting multipart marker for root %v: %w", th, err)
+			}
+		}
+		rootEntry := badger.NewEntry(
+			rootNodeKeyFmt.Encode(&th),
+			[]byte{},
+		)
+		if err = v4.changeBatch.SetEntryAt(rootEntry, versionToTs(version)); err != nil {
+			return fmt.Errorf("error setting root marker for root %v: %w", th, err)
+		}
+
+		entry := badger.NewEntry(
+			v4RootUpdatedNodesKeyFmt.Encode(version, &th),
+			cbor.Marshal(newUpdatedNodes),
+		)
+		err = v4.changeBatch.SetEntryAt(entry, item.Version())
+		if err != nil {
+			return fmt.Errorf("error storing updated nodes list for root %v: %w", th, err)
+		}
 	}
 
 	return nil
 }
 
 func (v4 *v4Migrator) keyMultipartRestoreNodeLog(item *badger.Item) error {
+	if item.IsDeletedOrExpired() {
+		// These keys are all at tsMetadata.
+		return nil
+	}
+
 	var h hash.Hash
 	if !v3MultipartRestoreNodeLogKeyFmt.Decode(item.Key(), &h) {
 		return fmt.Errorf("error decoding multipart restore key")
@@ -473,13 +523,12 @@ func (v4 *v4Migrator) migrateMeta() error {
 		v3MultipartRestoreNodeLogKeyFmt.Prefix(),
 		// Other keys don't need to be migrated.
 	}
-	skipFirst := true
 	if len(v4.meta.LastKey) == 0 {
 		v4.meta.LastKey = []byte{keyOrder[0]}
+		v4.meta.LastKeyVersion = maxTimestamp
 		// LastKey records the last _already processed_ key, so
 		// if we're only just starting up, the first key we see
 		// won't have been processed yet.
-		skipFirst = false
 	}
 
 	keyNexts := map[byte]byte{}
@@ -495,7 +544,9 @@ func (v4 *v4Migrator) migrateMeta() error {
 		v3MultipartRestoreNodeLogKeyFmt.Prefix(): v4.keyMultipartRestoreNodeLog,
 	}
 
-	it := v4.readTxn.NewIterator(badger.DefaultIteratorOptions)
+	opts := badger.DefaultIteratorOptions
+	opts.AllVersions = true
+	it := v4.readTxn.NewIterator(opts)
 	defer func() {
 		v4.readTxn.Discard()
 		v4.readTxn = v4.db.db.NewTransactionAt(maxTimestamp, false)
@@ -510,8 +561,7 @@ func (v4 *v4Migrator) migrateMeta() error {
 		it.Rewind()
 		it.Seek(v4.meta.LastKey)
 		for ; it.Valid(); it.Next() {
-			if skipFirst {
-				skipFirst = false
+			if bytes.Equal(v4.meta.LastKey, it.Item().Key()) && it.Item().Version() >= v4.meta.LastKeyVersion {
 				continue
 			}
 			if it.Item().Key()[0] != currentKey {
@@ -525,6 +575,7 @@ func (v4 *v4Migrator) migrateMeta() error {
 			v4.meta.CurrentMetaCount++
 			v4.helper.DisplayProgress("updated keys", v4.meta.CurrentMetaCount, v4.meta.MetaCount)
 			v4.meta.LastKey = it.Item().KeyCopy(v4.meta.LastKey)
+			v4.meta.LastKeyVersion = it.Item().Version()
 
 			// Save progress.
 			if err := v4.flush(false); err != nil {
@@ -546,6 +597,7 @@ func (v4 *v4Migrator) migrateMeta() error {
 			break
 		}
 		v4.meta.LastKey = []byte{currentKey}
+		v4.meta.LastKeyVersion = maxTimestamp
 	}
 
 	return nil
@@ -580,6 +632,7 @@ func (v4 *v4Migrator) Migrate() (rversion uint64, rerr error) {
 		func() {
 			opts := badger.DefaultIteratorOptions
 			opts.PrefetchValues = false
+			opts.AllVersions = true
 			it := v4.readTxn.NewIterator(opts)
 			defer it.Close()
 			it.Rewind()
@@ -606,6 +659,7 @@ func (v4 *v4Migrator) Migrate() (rversion uint64, rerr error) {
 		}
 		v4.meta.MetaComplete = true
 		v4.meta.LastKey = []byte{}
+		v4.meta.LastKeyVersion = maxTimestamp
 		if err := v4.flush(true); err != nil {
 			return 0, fmt.Errorf("error migrating metadata: %w", err)
 		}
