@@ -13,6 +13,7 @@ import (
 	"github.com/dgraph-io/badger/v2"
 	"github.com/stretchr/testify/require"
 
+	"github.com/oasisprotocol/oasis-core/go/common/cbor"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/hash"
 	"github.com/oasisprotocol/oasis-core/go/storage/mkvs"
 	"github.com/oasisprotocol/oasis-core/go/storage/mkvs/checkpoint"
@@ -42,6 +43,7 @@ var (
 
 type testCase struct {
 	PendingRoot    hash.Hash   `json:"pending_root"`
+	LongRoots      []hash.Hash `json:"long_roots"`
 	PendingVersion uint64      `json:"pending_version"`
 	Entries        []testEntry `json:"entries"`
 }
@@ -50,6 +52,7 @@ type testEntry struct {
 	Key     []byte `json:"key"`
 	Value   []byte `json:"value"`
 	Version uint64 `json:"version"`
+	Delete  bool   `json:"delete"`
 }
 
 func checkContents(ctx context.Context, t *testing.T, ndb api.NodeDB, root node.Root, testData [][][]byte) {
@@ -76,13 +79,13 @@ func makeDB(t *testing.T, caseName string) (context.Context, api.NodeDB, *badger
 type testMigrationHelper struct {
 }
 
-func (mh *testMigrationHelper) GetRootForHash(root hash.Hash, version uint64) (*node.Root, error) {
-	return &node.Root{
+func (mh *testMigrationHelper) GetRootForHash(root hash.Hash, version uint64) ([]node.Root, error) {
+	return []node.Root{{
 		Namespace: testNs,
 		Version:   version,
 		Type:      node.RootTypeState,
 		Hash:      root,
-	}, nil
+	}}, nil
 }
 
 func (mh *testMigrationHelper) DisplayStepBegin(msg string) {
@@ -180,7 +183,7 @@ type crashyMigrationHelper struct {
 
 const panicObj = "migration interruption"
 
-func (ch *crashyMigrationHelper) GetRootForHash(root hash.Hash, version uint64) (*node.Root, error) {
+func (ch *crashyMigrationHelper) GetRootForHash(root hash.Hash, version uint64) ([]node.Root, error) {
 	defer func() {
 		ch.metaCount--
 	}()
@@ -225,6 +228,210 @@ func TestBadgerV4MigrationCrashMeta(t *testing.T) {
 	checkContents(ctx, t, ndb, finalRoot, testData)
 }
 
+type sharedRootMigrationHelper struct {
+	testMigrationHelper
+}
+
+func (sh *sharedRootMigrationHelper) GetRootForHash(root hash.Hash, version uint64) ([]node.Root, error) {
+	return []node.Root{
+		{
+			Namespace: testNs,
+			Version:   version,
+			Type:      node.RootTypeState,
+			Hash:      root,
+		},
+		{
+			Namespace: testNs,
+			Version:   version,
+			Type:      node.RootTypeIO,
+			Hash:      root,
+		},
+	}, nil
+}
+
+func TestBadgerV4SharedRoots(t *testing.T) {
+	ctx, ndb, bdb, tc := makeDB(t, "case-long.json")
+	defer ndb.Close()
+	helper := &sharedRootMigrationHelper{}
+
+	migrator := originVersions[3](bdb, helper)
+	newVersion, err := migrator.Migrate()
+	require.NoError(t, err, "Migrate")
+	require.Equal(t, uint64(4), newVersion, "Migrate")
+
+	// Start using the migrated v4 database.
+	err = bdb.load()
+	require.NoError(t, err, "load")
+
+	// prettyPrintDBV4(ndb)
+	rounds := uint64(len(tc.LongRoots))
+
+	// Finalize the last round first.
+	err = ndb.Finalize(ctx, []node.Root{
+		{
+			Namespace: testNs,
+			Version:   rounds,
+			Type:      node.RootTypeState,
+			Hash:      tc.LongRoots[rounds-1],
+		},
+		{
+			Namespace: testNs,
+			Version:   rounds,
+			Type:      node.RootTypeIO,
+			Hash:      tc.LongRoots[rounds-1],
+		},
+	})
+	require.NoError(t, err, "Finalize")
+
+	allTypes := []node.RootType{
+		node.RootTypeState,
+		node.RootTypeIO,
+	}
+	for round := uint64(1); round < rounds; round++ {
+		// Check key accessibility for this round.
+		for _, typ := range allTypes {
+			root := node.Root{
+				Namespace: testNs,
+				Version:   round,
+				Type:      typ,
+				Hash:      tc.LongRoots[round-1],
+			}
+			tree := mkvs.NewWithRoot(nil, ndb, root)
+			require.NotNil(t, tree, "NewWithRoot")
+			for i := 1; i < 5; i++ {
+				key, val := mkLongKV(round, i)
+				var treeVal []byte
+				treeVal, err = tree.Get(ctx, key)
+				require.NoError(t, err, fmt.Sprintf("Get round %d, key %d", round, i))
+				require.Equal(t, val, treeVal, fmt.Sprintf("Value round %d, key %d", round, i))
+			}
+			tree.Close()
+		}
+
+		// Some extra checks.
+		err = checkSanityInternal(ctx, bdb, helper)
+		require.NoError(t, err, fmt.Sprintf("checkSanityInternal/%d", round))
+
+		// Try pruning, then move on. The following rounds should all still work.
+		err = ndb.Prune(ctx, round)
+		require.NoError(t, err, fmt.Sprintf("Prune/%d", round))
+	}
+	// prettyPrintDBV4(ndb)
+}
+
+func TestBadgerV4KeyVersioning(t *testing.T) {
+	// case-long has some keys that are both inserted and then deleted in
+	// a later version. All of these should be migrated and readable as V4 keys.
+	_, ndb, bdb, _ := makeDB(t, "case-long.json")
+	defer ndb.Close()
+	helper := &sharedRootMigrationHelper{}
+
+	migrator := originVersions[3](bdb, helper)
+	newVersion, err := migrator.Migrate()
+	require.NoError(t, err, "Migrate")
+	require.Equal(t, uint64(4), newVersion, "Migrate")
+
+	// Start using the migrated v4 database.
+	err = bdb.load()
+	require.NoError(t, err, "load")
+
+	txn := bdb.db.NewTransactionAt(math.MaxUint64, false)
+	defer txn.Discard()
+	itOpts := badger.DefaultIteratorOptions
+	itOpts.AllVersions = true
+	it := txn.NewIterator(itOpts)
+	defer it.Close()
+
+	// The GC can't run in in-memory databases, so this is
+	// an unfortunate necessary step. Find all keys with no associated values in the db
+	// (i.e. ones with only deletion flags).
+	valuedKeys := map[string]bool{}
+	for it.Rewind(); it.Valid(); it.Next() {
+		key := fmt.Sprintf("%v", it.Item().Key())
+		valuedKeys[key] = valuedKeys[key] || !it.Item().IsDeletedOrExpired()
+	}
+
+	var h hash.Hash
+	var th1, th2 typedHash
+	var v uint64
+
+	for it.Rewind(); it.Valid(); it.Next() {
+		val, _ := it.Item().ValueCopy(nil)
+		key := it.Item().Key()
+		skippable := fmt.Sprintf("%v", key)
+		if valuedKeys[skippable] == false {
+			continue
+		}
+		switch {
+		case nodeKeyFmt.Decode(key, &h):
+			// Nothing to do.
+		case writeLogKeyFmt.Decode(key, &v, &th1, &th2):
+			// Nothing to do.
+		case rootsMetadataKeyFmt.Decode(key, &v):
+			if !it.Item().IsDeletedOrExpired() {
+				meta := rootsMetadata{}
+				err = cbor.UnmarshalTrusted(val, &meta)
+				require.NoError(t, err, "rootsMetadata cbor unmarshal")
+			}
+		case rootUpdatedNodesKeyFmt.Decode(key, &v, &th1):
+			// Nothing to do.
+		case multipartRestoreNodeLogKeyFmt.Decode(key, &th1):
+			// Nothing to do.
+		case rootNodeKeyFmt.Decode(key, &th1):
+			// Nothing to do.
+		case metadataKeyFmt.Decode(key):
+			// Nothing to do.
+		default:
+			require.FailNow(t, "unknown key")
+		}
+	}
+}
+
+func prettyPrintDBV4(ndb api.NodeDB) { // nolint: deadcode, unused
+	db := ndb.(*badgerNodeDB).db
+	txn := db.NewTransactionAt(math.MaxUint64, false)
+	defer txn.Discard()
+	itOpts := badger.DefaultIteratorOptions
+	itOpts.AllVersions = true
+	it := txn.NewIterator(itOpts)
+	defer it.Close()
+
+	var h hash.Hash
+	var th1, th2 typedHash
+	var v uint64
+
+	for it.Rewind(); it.Valid(); it.Next() {
+		val, _ := it.Item().ValueCopy(nil)
+		key := it.Item().Key()
+		if it.Item().IsDeletedOrExpired() {
+			fmt.Printf("deleted @ %v, ", it.Item().Version())
+		} else {
+			fmt.Printf("inserted @ %v, ", it.Item().Version())
+		}
+		switch {
+		case nodeKeyFmt.Decode(key, &h):
+			fmt.Printf("node %v\n", h)
+		case writeLogKeyFmt.Decode(key, &v, &th1, &th2):
+			fmt.Printf("write log @ %v, %v -> %v\n", v, th1, th2)
+		case rootsMetadataKeyFmt.Decode(key, &v):
+			fmt.Printf("roots metadata @ %v:\n", v)
+			if !it.Item().IsDeletedOrExpired() {
+				meta := rootsMetadata{}
+				_ = cbor.UnmarshalTrusted(val, &meta)
+				for root, chain := range meta.Roots {
+					fmt.Printf("- %v -> %v\n", root, chain)
+				}
+			}
+		case rootUpdatedNodesKeyFmt.Decode(key, &v, &th1):
+			fmt.Printf("root updated nodes @ %v, %v\n", v, th1)
+		case multipartRestoreNodeLogKeyFmt.Decode(key, &th1):
+			fmt.Printf("multipart restore node %v\n", th1)
+		case rootNodeKeyFmt.Decode(key, &th1):
+			fmt.Printf("root node marker %v\n", th1)
+		}
+	}
+}
+
 func readDump(t *testing.T, ndb api.NodeDB, caseName string) (tc testCase) { // nolint: deadcode, unused
 	data, err := ioutil.ReadFile(filepath.Join("testdata", caseName))
 	require.NoError(t, err, "ReadFile")
@@ -234,8 +441,13 @@ func readDump(t *testing.T, ndb api.NodeDB, caseName string) (tc testCase) { // 
 	b := ndb.(*badgerNodeDB).db.NewWriteBatchAt(1)
 	defer b.Cancel()
 	for _, e := range tc.Entries {
-		err = b.SetEntryAt(badger.NewEntry(e.Key, e.Value), e.Version)
-		require.NoError(t, err, "SetEntryAt")
+		if e.Delete {
+			err = b.DeleteAt(e.Key, e.Version)
+			require.NoError(t, err, "readDump/DeleteAt")
+		} else {
+			err = b.SetEntryAt(badger.NewEntry(e.Key, e.Value), e.Version)
+			require.NoError(t, err, "readDump/SetEntryAt")
+		}
 	}
 	b.Flush()
 	return
@@ -245,16 +457,24 @@ func dumpDB(ndb api.NodeDB, caseName string, tc testCase) { // nolint: deadcode,
 	db := ndb.(*badgerNodeDB).db
 	txn := db.NewTransactionAt(math.MaxUint64, false)
 	defer txn.Discard()
-	it := txn.NewIterator(badger.DefaultIteratorOptions)
+	itOpts := badger.DefaultIteratorOptions
+	itOpts.AllVersions = true
+	it := txn.NewIterator(itOpts)
 	defer it.Close()
 
 	for it.Rewind(); it.Valid(); it.Next() {
 		val, _ := it.Item().ValueCopy(nil)
-		tc.Entries = append(tc.Entries, testEntry{
-			Key:     it.Item().Key(),
+		entry := testEntry{
+			Key:     it.Item().KeyCopy(nil),
 			Value:   val,
 			Version: it.Item().Version(),
-		})
+		}
+		// Versions are iterated over in reverse order (from high to low), but that's fine;
+		// badger can delete a key that doesn't exist yet, which simplifies things.
+		if it.Item().IsDeletedOrExpired() {
+			entry.Delete = true
+		}
+		tc.Entries = append(tc.Entries, entry)
 	}
 	if caseName != "" {
 		marshalled, _ := json.MarshalIndent(tc, "", "\t")
@@ -262,8 +482,56 @@ func dumpDB(ndb api.NodeDB, caseName string, tc testCase) { // nolint: deadcode,
 	}
 }
 
+func mkLongKV(round uint64, key int) ([]byte, []byte) {
+	return []byte(fmt.Sprintf("test key; round %d with %d index", round, key)),
+		[]byte(fmt.Sprintf("interesting value %d.%d", round, key))
+}
+
+/*func prettyPrintDBV3(ndb api.NodeDB) {
+	db := ndb.(*badgerNodeDB).db
+	txn := db.NewTransactionAt(math.MaxUint64, false)
+	defer txn.Discard()
+	itOpts := badger.DefaultIteratorOptions
+	itOpts.AllVersions = true
+	it := txn.NewIterator(itOpts)
+	defer it.Close()
+
+	var h hash.Hash
+	var h1, h2 hash.Hash
+	var v uint64
+
+	for it.Rewind(); it.Valid(); it.Next() {
+		val, _ := it.Item().ValueCopy(nil)
+		key := it.Item().Key()
+		if it.Item().IsDeletedOrExpired() {
+			fmt.Printf("deleted @ %v, ", it.Item().Version())
+		} else {
+			fmt.Printf("inserted @ %v, ", it.Item().Version())
+		}
+		switch {
+		case nodeKeyFmt.Decode(key, &h):
+			fmt.Printf("node %v\n", h)
+		case writeLogKeyFmt.Decode(key, &v, &h1, &h2):
+			fmt.Printf("write log @ %v, %v -> %v\n", v, h1, h2)
+		case rootsMetadataKeyFmt.Decode(key, &v):
+			fmt.Printf("roots metadata @ %v:\n", v)
+			if !it.Item().IsDeletedOrExpired() {
+				meta := rootsMetadata{}
+				_ = cbor.UnmarshalTrusted(val, &meta)
+				for root, chain := range meta.Roots {
+					fmt.Printf("- %v -> %v\n", root, chain)
+				}
+			}
+		case rootUpdatedNodesKeyFmt.Decode(key, &v, &h1):
+			fmt.Printf("root updated nodes @ %v, %v\n", v, h1)
+		case multipartRestoreNodeLogKeyFmt.Decode(key, &h1):
+			fmt.Printf("multipart restore node %v\n", h1)
+		}
+	}
+}
+
 // Use this to produce v3 database contents on a commit before dbVersion = 4.
-/*func TestBadgerV3InitialFill(t *testing.T) {
+func TestBadgerV3InitialFill(t *testing.T) {
 	ctx := context.Background()
 
 	initialFill := func(ndb api.NodeDB) mkvs.Tree {
@@ -368,4 +636,49 @@ func dumpDB(ndb api.NodeDB, caseName string, tc testCase) { // nolint: deadcode,
 		PendingRoot:    ckMeta.Root.Hash,
 		PendingVersion: ckMeta.Root.Version,
 	})
+}
+
+// Produce multiple rounds with predictable keys and a degree of sharing in
+// the tree nodes. Leave out finalization for the last one.
+func TestBadgerV3MultiroundFill(t *testing.T) {
+	ctx := context.Background()
+
+	ndb, err := New(dbCfg)
+	require.NoError(t, err, "New")
+	defer ndb.Close()
+
+	emptyRoot := node.Root{
+		Namespace: testNs,
+		Version:   0,
+	}
+	emptyRoot.Hash.Empty()
+
+	tree := mkvs.NewWithRoot(nil, ndb, emptyRoot)
+	require.NotNil(t, tree, "NewWithRoot")
+
+	tc := testCase{}
+
+	maxRound := uint64(10)
+	for round := uint64(1); round < maxRound; round++ {
+		wl := writelog.WriteLog{}
+		for i := 1; i < 5; i++ {
+			key, val := mkLongKV(round, i)
+			wl = append(wl, writelog.LogEntry{Key: key, Value: val})
+		}
+		err := tree.ApplyWriteLog(ctx, writelog.NewStaticIterator(wl))
+		require.NoError(t, err, "ApplyWriteLog")
+
+		_, rootHash, err := tree.Commit(ctx, testNs, round)
+		require.NoError(t, err, "Commit")
+		tc.LongRoots = append(tc.LongRoots, rootHash)
+		if round < maxRound-1 {
+			err = ndb.Finalize(ctx, round, []hash.Hash{rootHash})
+			require.NoError(t, err, "Finalize")
+		}
+	}
+	tree.Close()
+
+	// Dump everything.
+	dumpDB(ndb, "case-long.json", tc)
+	prettyPrintDBV3(ndb)
 }*/

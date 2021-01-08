@@ -104,7 +104,7 @@ type migrateHelper struct {
 	roots   map[hash.Hash]node.RootType
 }
 
-func (mh *migrateHelper) GetRootForHash(root hash.Hash, version uint64) (*node.Root, error) {
+func (mh *migrateHelper) GetRootForHash(root hash.Hash, version uint64) ([]node.Root, error) {
 	block, err := mh.history.GetBlock(mh.ctx, version)
 	if err != nil {
 		if errors.Is(err, roothash.ErrNotFound) {
@@ -113,12 +113,13 @@ func (mh *migrateHelper) GetRootForHash(root hash.Hash, version uint64) (*node.R
 		return nil, err
 	}
 
+	var roots []node.Root
 	for _, blockRoot := range block.Header.StorageRoots() {
 		if blockRoot.Hash.Equal(&root) {
-			return &blockRoot, nil
+			roots = append(roots, blockRoot)
 		}
 	}
-	return nil, nil
+	return roots, nil
 }
 
 func doMigrate(cmd *cobra.Command, args []string) {
