@@ -41,8 +41,9 @@ func (nd *testMsgDispatcher) Publish(ctx *abciAPI.Context, kind, msg interface{}
 	}
 
 	gasCosts := transaction.Costs{
-		"transfer": 1000,
-		"withdraw": 2000,
+		staking.GasOpTransfer:         1000,
+		staking.GasOpWithdraw:         2000,
+		registry.GasOpRegisterRuntime: 3000,
 	}
 
 	switch kind {
@@ -50,17 +51,28 @@ func (nd *testMsgDispatcher) Publish(ctx *abciAPI.Context, kind, msg interface{}
 		m := msg.(*message.StakingMessage)
 		switch {
 		case m.Transfer != nil:
-			if err := ctx.Gas().UseGas(1, "transfer", gasCosts); err != nil {
+			if err := ctx.Gas().UseGas(1, staking.GasOpTransfer, gasCosts); err != nil {
 				return err
 			}
 			return nil
 		case m.Withdraw != nil:
-			if err := ctx.Gas().UseGas(1, "withdraw", gasCosts); err != nil {
+			if err := ctx.Gas().UseGas(1, staking.GasOpWithdraw, gasCosts); err != nil {
 				return err
 			}
 			return nil
 		default:
 			return staking.ErrInvalidArgument
+		}
+	case roothashApi.RuntimeMessageRegistry:
+		m := msg.(*message.RegistryMessage)
+		switch {
+		case m.UpdateRuntime != nil:
+			if err := ctx.Gas().UseGas(1, registry.GasOpRegisterRuntime, gasCosts); err != nil {
+				return err
+			}
+			return nil
+		default:
+			return registry.ErrInvalidArgument
 		}
 	default:
 		return staking.ErrInvalidArgument
@@ -157,6 +169,9 @@ func TestMessagesGasEstimation(t *testing.T) {
 		{Staking: &message.StakingMessage{Transfer: &staking.Transfer{}}},
 		// Each withdraw message costs 2000 gas.
 		{Staking: &message.StakingMessage{Withdraw: &staking.Withdraw{}}},
+		// Each update_runtime message costs 3000 gas, but this one is invalid,
+		// so it will not use any gas.
+		{Registry: &message.RegistryMessage{UpdateRuntime: &registry.Runtime{}}},
 	}
 	msgsHash := message.MessagesHash(msgs)
 
