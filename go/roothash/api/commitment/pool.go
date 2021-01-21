@@ -263,6 +263,8 @@ func (p *Pool) addOpenExecutorCommitment(
 		return ErrTxnSchedSigInvalid
 	}
 
+	// TODO: check for evidence of equivocation.
+
 	switch openCom.IsIndicatingFailure() {
 	case true:
 	default:
