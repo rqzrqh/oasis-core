@@ -347,18 +347,28 @@ func TestBadgerV4KeyVersioning(t *testing.T) {
 	// (i.e. ones with only deletion flags).
 	valuedKeys := map[string]bool{}
 	for it.Rewind(); it.Valid(); it.Next() {
-		key := fmt.Sprintf("%v", it.Item().Key())
+		key := string(it.Item().Key())
 		valuedKeys[key] = valuedKeys[key] || !it.Item().IsDeletedOrExpired()
+	}
+	for k, v := range valuedKeys {
+		if v {
+			continue
+		}
+		fmt.Printf("key %v has no value\n", []byte(k))
 	}
 
 	var h hash.Hash
 	var th1, th2 typedHash
 	var v uint64
 
+	// Check that all key versions have been migrated. I.e. keys formatted with the
+	// old keyformats should not exist anymore (modulo GC, in valuedKeyes) and all accessible
+	// keys should have new formats.
 	for it.Rewind(); it.Valid(); it.Next() {
 		val, _ := it.Item().ValueCopy(nil)
 		key := it.Item().Key()
-		skippable := fmt.Sprintf("%v", key)
+		skippable := string(key)
+		fmt.Printf("examining @ %v key %v, with value %v\n", it.Item().Version(), it.Item().Key(), valuedKeys[skippable])
 		if valuedKeys[skippable] == false {
 			continue
 		}
@@ -444,9 +454,11 @@ func readDump(t *testing.T, ndb api.NodeDB, caseName string) (tc testCase) { // 
 		if e.Delete {
 			err = b.DeleteAt(e.Key, e.Version)
 			require.NoError(t, err, "readDump/DeleteAt")
+			fmt.Printf("deleted %v @ %v\n", e.Key, e.Version)
 		} else {
 			err = b.SetEntryAt(badger.NewEntry(e.Key, e.Value), e.Version)
 			require.NoError(t, err, "readDump/SetEntryAt")
+			fmt.Printf("inserted %v @ %v\n", e.Key, e.Version)
 		}
 	}
 	b.Flush()

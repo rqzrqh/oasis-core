@@ -545,7 +545,7 @@ func (v4 *v4Migrator) migrateMeta() error {
 	}
 
 	opts := badger.DefaultIteratorOptions
-	opts.AllVersions = true
+	//opts.AllVersions = true
 	it := v4.readTxn.NewIterator(opts)
 	defer func() {
 		v4.readTxn.Discard()
@@ -632,7 +632,7 @@ func (v4 *v4Migrator) Migrate() (rversion uint64, rerr error) {
 		func() {
 			opts := badger.DefaultIteratorOptions
 			opts.PrefetchValues = false
-			opts.AllVersions = true
+			//opts.AllVersions = true
 			it := v4.readTxn.NewIterator(opts)
 			defer it.Close()
 			it.Rewind()
