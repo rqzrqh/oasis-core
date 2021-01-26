@@ -98,6 +98,28 @@ func (worker *Storage) Start() error {
 	return worker.startNode()
 }
 
+func (worker *Storage) BuildArgs() []string {
+	args := newArgBuilder().
+		debugDontBlameOasis().
+		debugAllowTestKeys()
+
+	var runtimeArray []*Runtime
+	if len(worker.runtimes) > 0 {
+		for _, idx := range worker.runtimes {
+			runtimeArray = append(runtimeArray, worker.net.runtimes[idx])
+		}
+	} else {
+		runtimeArray = worker.net.runtimes
+	}
+	for _, v := range runtimeArray {
+		if v.kind != registry.KindCompute {
+			continue
+		}
+		args = args.runtimeSupported(v.id)
+	}
+	return args.vec
+}
+
 func (worker *Storage) startNode() error {
 	var err error
 

@@ -76,7 +76,8 @@ func doExport(cmd *cobra.Command, args []string) {
 		)
 
 		if err := exportRuntime(dataDir, destDir, runtimeID, rtg); err != nil {
-			return
+			logger.Error("error exporting storage for runtime", "runtime_id", runtimeID)
+			//return
 		}
 	}
 

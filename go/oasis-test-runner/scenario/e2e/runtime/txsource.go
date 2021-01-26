@@ -14,6 +14,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"bytes"
+	"path/filepath"
+	"encoding/json"
 
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/drbg"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/mathrand"
@@ -22,6 +25,7 @@ import (
 	"github.com/oasisprotocol/oasis-core/go/common/quantity"
 	consensus "github.com/oasisprotocol/oasis-core/go/consensus/api"
 	"github.com/oasisprotocol/oasis-core/go/consensus/api/transaction"
+	genesisFile "github.com/oasisprotocol/oasis-core/go/genesis/file"
 	governance "github.com/oasisprotocol/oasis-core/go/governance/api"
 	"github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common"
 	"github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/flags"
@@ -30,6 +34,7 @@ import (
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/env"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/log"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/oasis"
+	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/oasis/cli"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/scenario"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/scenario/e2e"
 	staking "github.com/oasisprotocol/oasis-core/go/staking/api"
@@ -47,6 +52,8 @@ const (
 	txSourceGasPrice        = 1
 
 	crashPointProbability = 0.0005
+
+	initialTest = false
 )
 
 // TxSourceMultiShort uses multiple workloads for a short time.
@@ -234,6 +241,10 @@ func (sc *txSourceImpl) Fixture() (*oasis.NetworkFixture, error) {
 	}
 	// Use deterministic identities as we need to allocate funds to nodes.
 	f.Network.DeterministicIdentities = true
+	if !initialTest {
+		f.Network.RestoreIdentities = true
+		f.Network.GenesisFile = "/tmp/oasis-txsource-multi-short/e2e/runtime/txsource-multi-short/genesis_dump.json"
+	}
 	f.Network.GovernanceParameters = &governance.ConsensusParameters{
 		VotingPeriod:              10,
 		MinProposalDeposit:        *quantity.NewFromUint64(300),
@@ -399,11 +410,20 @@ func (sc *txSourceImpl) Fixture() (*oasis.NetworkFixture, error) {
 			},
 		},
 	}
-	f.Entities = []oasis.EntityCfg{
-		{IsDebugTestEntity: true},
-	}
-	for i := 0; i < sc.numValidatorNodes; i++ {
-		f.Entities = append(f.Entities, oasis.EntityCfg{})
+	if !initialTest {
+		f.Entities = []oasis.EntityCfg{
+			{IsDebugTestEntity: true, Restore: true},
+		}
+		for i := 0; i < sc.numValidatorNodes; i++ {
+			f.Entities = append(f.Entities, oasis.EntityCfg{Restore: true})
+		}
+	} else {
+		f.Entities = []oasis.EntityCfg{
+			{IsDebugTestEntity: true},
+		}
+		for i := 0; i < sc.numValidatorNodes; i++ {
+			f.Entities = append(f.Entities, oasis.EntityCfg{})
+		}
 	}
 
 	// Runtime configuration.
@@ -801,6 +821,29 @@ func (sc *txSourceImpl) Clone() scenario.Scenario {
 }
 
 func (sc *txSourceImpl) Run(childEnv *env.Env) error {
+	// Migrate all the databases.
+	/*for _, storageNode := range sc.Net.StorageWorkers() {
+		args := []string{
+			"storage", "migrate",
+			"--datadir", storageNode.DataDir(),
+		}
+		args = append(args, storageNode.BuildArgs()...)
+		fmt.Printf("storage node args are: %v\n", args)
+		if err := cli.RunSubCommand(childEnv, sc.Logger, "storage-migrate", sc.Net.Config().NodeBinary, args); err != nil {
+			return fmt.Errorf("scenario/e2e/txsource-multi-short: failed to migrate storage database: %w", err)
+		}
+		args = []string{
+			"storage", "check",
+			"--datadir", storageNode.DataDir(),
+		}
+		args = append(args, storageNode.BuildArgs()...)
+		fmt.Printf("storage node args are: %v\n", args)
+		if err := cli.RunSubCommand(childEnv, sc.Logger, "storage-check", sc.Net.Config().NodeBinary, args); err != nil {
+			return fmt.Errorf("scenario/e2e/txsource-multi-short: storage database check failed: %w", err)
+		}
+	}*/
+	//return fmt.Errorf("not thinking of starting this, were you?")
+
 	if err := sc.Net.Start(); err != nil {
 		return fmt.Errorf("scenario net Start: %w", err)
 	}
@@ -844,6 +887,100 @@ func (sc *txSourceImpl) Run(childEnv *env.Env) error {
 	if err != nil {
 		return err
 	}
+
+	// Dump the network state.
+	dumpPath := filepath.Join(childEnv.Dir(), "genesis_dump.json")
+	args := []string{
+		"genesis", "dump",
+		"--height", "0",
+		"--genesis.file", dumpPath,
+		"--address", "unix:" + sc.Net.Validators()[0].SocketPath(),
+	}
+	if err := cli.RunSubCommand(childEnv, sc.Logger, "genesis-dump", sc.Net.Config().NodeBinary, args); err != nil {
+		return fmt.Errorf("scenario/e2e/runtime/txsource: failed to dump state: %w", err)
+	}
+	childEnv.AddOnCleanup(func() {
+		err := func() error {
+			eFp, err := genesisFile.NewFileProvider(dumpPath)
+			if err != nil {
+				return fmt.Errorf("failed to instantiate file provider (export): %w", err)
+			}
+			exportedDoc, err := eFp.GetGenesisDocument()
+			if err != nil {
+				return fmt.Errorf("failed to get genesis doc (export): %w", err)
+			}
+
+			sc.Logger.Info("dumping via debug dumpdb")
+
+			// Dump the state with the debug command off one of the validators.
+			dbDumpPath := filepath.Join(childEnv.Dir(), "debug_dump.json")
+			args := []string{
+				"debug", "dumpdb",
+				"--datadir", sc.Net.Validators()[0].DataDir(),
+				"-g", sc.Net.GenesisPath(),
+				"--dump.version", fmt.Sprintf("%d", exportedDoc.Height),
+				"--dump.output", dbDumpPath,
+				"--debug.dont_blame_oasis",
+				"--debug.allow_test_keys",
+			}
+			if err = cli.RunSubCommand(childEnv, sc.Logger, "debug-dump", sc.Net.Config().NodeBinary, args); err != nil {
+				return fmt.Errorf("failed to dump database: %w", err)
+			}
+
+			// Load the dumped state.
+			fp, err := genesisFile.NewFileProvider(dbDumpPath)
+			if err != nil {
+				return fmt.Errorf("failed to instantiate file provider (db): %w", err)
+			}
+			dbDoc, err := fp.GetGenesisDocument()
+			if err != nil {
+				return fmt.Errorf("failed to get genesis doc (dump): %w", err)
+			}
+
+			// Compare the two documents for approximate equality.  Note: Certain
+			// fields will be different, so those are fixed up before the comparison.
+			dbDoc.EpochTime.Base = exportedDoc.EpochTime.Base
+			dbDoc.Time = exportedDoc.Time
+			dbRaw, err := json.Marshal(dbDoc)
+			if err != nil {
+				return fmt.Errorf("failed to marshal fixed up dump: %w", err)
+			}
+			expRaw, err := json.Marshal(exportedDoc)
+			if err != nil {
+				return fmt.Errorf("failed to re-marshal export doc: %w", err)
+			}
+			if !bytes.Equal(expRaw, dbRaw) {
+				//return fmt.Errorf("dump does not match state export")
+				sc.Logger.Error("dump does not match state export (ignored)")
+				//return nil
+			}
+
+			/*if len(sc.Net.StorageWorkers()) > 0 {
+				// Dump storage.
+				args = []string{
+					"debug", "storage", "export",
+					"--genesis.file", dumpPath,
+					"--datadir", sc.Net.StorageWorkers()[0].DataDir(),
+					"--storage.export.dir", filepath.Join(childEnv.Dir(), "storage_dumps"),
+					"--debug.dont_blame_oasis",
+					"--debug.allow_test_keys",
+				}
+				if err := cli.RunSubCommand(childEnv, sc.Logger, "storage-dump", sc.Net.Config().NodeBinary, args); err != nil {
+					return fmt.Errorf("scenario/e2e/dump_restore: failed to dump storage: %w", err)
+				}
+			}*/
+
+			// Reset all the state back to the vanilla state.
+			if err := sc.ResetConsensusState(childEnv); err != nil {
+				return fmt.Errorf("scenario/e2e/dump_restore: failed to clean tendemint storage: %w", err)
+			}
+			sc.Logger.Info("dump finished, all seems to have gone well")
+			return nil
+		}()
+		if err != nil {
+			sc.Logger.Error(fmt.Sprintf("error while dumping state: %v", err))
+		}
+	})
 
 	if err = sc.Net.CheckLogWatchers(); err != nil {
 		return err

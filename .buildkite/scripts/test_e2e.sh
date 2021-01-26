@@ -51,7 +51,8 @@ set -x
 
 # Run Oasis test runner.
 ${test_runner_binary} \
-    ${BUILDKITE:+--basedir ${TEST_BASE_DIR:-$PWD}/e2e} \
+    --basedir /tmp/oasis-txsource-multi-short \
+    --basedir.no_temp_dir \
     --basedir.no_cleanup \
     --e2e.node.binary ${node_binary} \
     --e2e/runtime.client.binary_dir ${WORKDIR}/target/default/debug \
@@ -63,6 +64,7 @@ ${test_runner_binary} \
     --plugin-signer.name example \
     --plugin-signer.binary ${WORKDIR}/go/oasis-test-runner/scenario/pluginsigner/example_signer_plugin/example_signer_plugin \
     --log.level info \
+    -s e2e/runtime/txsource-multi-short \
     ${BUILDKITE_PARALLEL_JOB_COUNT:+--parallel.job_count ${BUILDKITE_PARALLEL_JOB_COUNT}} \
     ${BUILDKITE_PARALLEL_JOB:+--parallel.job_index ${BUILDKITE_PARALLEL_JOB}} \
     "$@"
