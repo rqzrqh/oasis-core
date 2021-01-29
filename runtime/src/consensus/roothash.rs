@@ -13,7 +13,7 @@ use crate::{
         crypto::{hash::Hash, signature::SignatureBundle},
         namespace::Namespace,
     },
-    consensus::staking,
+    consensus::{registry, staking},
 };
 
 /// Runtime block.
@@ -62,6 +62,12 @@ pub enum Message {
         #[serde(flatten)]
         msg: StakingMessage,
     },
+    #[serde(rename = "registry")]
+    Registry {
+        v: u16,
+        #[serde(flatten)]
+        msg: RegistryMessage,
+    },
 }
 
 impl Message {
@@ -81,6 +87,12 @@ pub enum StakingMessage {
     Transfer(staking::Transfer),
     #[serde(rename = "withdraw")]
     Withdraw(staking::Withdraw),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RegistryMessage {
+    #[serde(rename = "transfer")]
+    UpdateRuntime(registry::Runtime),
 }
 
 /// Result of a message being processed by the consensus layer.

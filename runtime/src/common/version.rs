@@ -1,9 +1,9 @@
 /// Protocol and runtime versioning.
-
 // NOTE: This should be kept in sync with go/common/version/version.go.
+use serde::{Deserialize, Serialize};
 
 /// A protocol or runtime version.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Version {
     pub major: u16,
     pub minor: u16,
