@@ -53,7 +53,7 @@ const (
 
 	crashPointProbability = 0.0005
 
-	initialTest = false
+	initialTest = true
 )
 
 // TxSourceMultiShort uses multiple workloads for a short time.
@@ -74,9 +74,9 @@ var TxSourceMultiShort scenario.Scenario = &txSourceImpl{
 	},
 	timeLimit:                         timeLimitShort,
 	livenessCheckInterval:             livenessCheckInterval,
-	consensusPruneDisabledProbability: 0.1,
-	consensusPruneMinKept:             100,
-	consensusPruneMaxKept:             200,
+	consensusPruneDisabledProbability: 1.0,
+	consensusPruneMinKept:             1000,
+	consensusPruneMaxKept:             2000,
 	numValidatorNodes:                 4,
 	numKeyManagerNodes:                2,
 	numStorageNodes:                   2,
@@ -752,7 +752,7 @@ func (sc *txSourceImpl) startWorkload(childEnv *env.Env, errCh chan error, name 
 		"--" + txsource.CfgSeed, sc.seed,
 		"--" + txsource.CfgGasPrice, strconv.FormatUint(txSourceGasPrice, 10),
 		// Use half the configured interval due to fast blocks.
-		"--" + workload.CfgConsensusNumKeptVersions, strconv.FormatUint(node.Consensus().PruneNumKept/2, 10),
+		//"--" + workload.CfgConsensusNumKeptVersions, strconv.FormatUint(node.Consensus().PruneNumKept/2, 10),
 	}
 	for _, ent := range sc.Net.Entities()[1:] {
 		args = append(args, "--"+txsource.CfgValidatorEntity, ent.EntityKeyPath())
@@ -785,11 +785,13 @@ func (sc *txSourceImpl) startWorkload(childEnv *env.Env, errCh chan error, name 
 	}
 
 	go func() {
-		errCh <- cmd.Wait()
+		waitErr := cmd.Wait()
+		errCh <- waitErr
 
 		sc.Logger.Info("workload finished",
 			"name", name,
 			"node", node.Name,
+			"err", waitErr,
 		)
 	}()
 
@@ -885,102 +887,111 @@ func (sc *txSourceImpl) Run(childEnv *env.Env) error {
 	case err = <-errCh:
 	}
 	if err != nil {
+		sc.Logger.Error("first workload terminated with an error", "err", err)
 		return err
 	}
 
-	// Dump the network state.
-	dumpPath := filepath.Join(childEnv.Dir(), "genesis_dump.json")
-	args := []string{
-		"genesis", "dump",
-		"--height", "0",
-		"--genesis.file", dumpPath,
-		"--address", "unix:" + sc.Net.Validators()[0].SocketPath(),
-	}
-	if err := cli.RunSubCommand(childEnv, sc.Logger, "genesis-dump", sc.Net.Config().NodeBinary, args); err != nil {
-		return fmt.Errorf("scenario/e2e/runtime/txsource: failed to dump state: %w", err)
-	}
-	childEnv.AddOnCleanup(func() {
-		err := func() error {
-			eFp, err := genesisFile.NewFileProvider(dumpPath)
-			if err != nil {
-				return fmt.Errorf("failed to instantiate file provider (export): %w", err)
-			}
-			exportedDoc, err := eFp.GetGenesisDocument()
-			if err != nil {
-				return fmt.Errorf("failed to get genesis doc (export): %w", err)
-			}
+	if initialTest {
+		// Stall consensus.
+		for _, val := range sc.Net.Validators()[1:] {
+			val.RequestShutdown(ctx, true)
+			<-val.Exit()
+		}
 
-			sc.Logger.Info("dumping via debug dumpdb")
+		// Dump the network state.
+		dumpPath := filepath.Join(childEnv.Dir(), "genesis_dump.json")
+		args := []string{
+			"genesis", "dump",
+			"--height", "0",
+			"--genesis.file", dumpPath,
+			"--address", "unix:" + sc.Net.Validators()[0].SocketPath(),
+		}
+		if err := cli.RunSubCommand(childEnv, sc.Logger, "genesis-dump", sc.Net.Config().NodeBinary, args); err != nil {
+			return fmt.Errorf("scenario/e2e/runtime/txsource: failed to dump state: %w", err)
+		}
+		childEnv.AddOnCleanup(func() {
+			err := func() error {
+				eFp, err := genesisFile.NewFileProvider(dumpPath)
+				if err != nil {
+					return fmt.Errorf("failed to instantiate file provider (export): %w", err)
+				}
+				exportedDoc, err := eFp.GetGenesisDocument()
+				if err != nil {
+					return fmt.Errorf("failed to get genesis doc (export): %w", err)
+				}
 
-			// Dump the state with the debug command off one of the validators.
-			dbDumpPath := filepath.Join(childEnv.Dir(), "debug_dump.json")
-			args := []string{
-				"debug", "dumpdb",
-				"--datadir", sc.Net.Validators()[0].DataDir(),
-				"-g", sc.Net.GenesisPath(),
-				"--dump.version", fmt.Sprintf("%d", exportedDoc.Height),
-				"--dump.output", dbDumpPath,
-				"--debug.dont_blame_oasis",
-				"--debug.allow_test_keys",
-			}
-			if err = cli.RunSubCommand(childEnv, sc.Logger, "debug-dump", sc.Net.Config().NodeBinary, args); err != nil {
-				return fmt.Errorf("failed to dump database: %w", err)
-			}
+				sc.Logger.Info("dumping via debug dumpdb")
 
-			// Load the dumped state.
-			fp, err := genesisFile.NewFileProvider(dbDumpPath)
-			if err != nil {
-				return fmt.Errorf("failed to instantiate file provider (db): %w", err)
-			}
-			dbDoc, err := fp.GetGenesisDocument()
-			if err != nil {
-				return fmt.Errorf("failed to get genesis doc (dump): %w", err)
-			}
-
-			// Compare the two documents for approximate equality.  Note: Certain
-			// fields will be different, so those are fixed up before the comparison.
-			dbDoc.EpochTime.Base = exportedDoc.EpochTime.Base
-			dbDoc.Time = exportedDoc.Time
-			dbRaw, err := json.Marshal(dbDoc)
-			if err != nil {
-				return fmt.Errorf("failed to marshal fixed up dump: %w", err)
-			}
-			expRaw, err := json.Marshal(exportedDoc)
-			if err != nil {
-				return fmt.Errorf("failed to re-marshal export doc: %w", err)
-			}
-			if !bytes.Equal(expRaw, dbRaw) {
-				//return fmt.Errorf("dump does not match state export")
-				sc.Logger.Error("dump does not match state export (ignored)")
-				//return nil
-			}
-
-			/*if len(sc.Net.StorageWorkers()) > 0 {
-				// Dump storage.
-				args = []string{
-					"debug", "storage", "export",
-					"--genesis.file", dumpPath,
-					"--datadir", sc.Net.StorageWorkers()[0].DataDir(),
-					"--storage.export.dir", filepath.Join(childEnv.Dir(), "storage_dumps"),
+				// Dump the state with the debug command off one of the validators.
+				dbDumpPath := filepath.Join(childEnv.Dir(), "debug_dump.json")
+				args := []string{
+					"debug", "dumpdb",
+					"--datadir", sc.Net.Validators()[0].DataDir(),
+					"-g", sc.Net.GenesisPath(),
+					"--dump.version", fmt.Sprintf("%d", exportedDoc.Height),
+					"--dump.output", dbDumpPath,
 					"--debug.dont_blame_oasis",
 					"--debug.allow_test_keys",
 				}
-				if err := cli.RunSubCommand(childEnv, sc.Logger, "storage-dump", sc.Net.Config().NodeBinary, args); err != nil {
-					return fmt.Errorf("scenario/e2e/dump_restore: failed to dump storage: %w", err)
+				if err = cli.RunSubCommand(childEnv, sc.Logger, "debug-dump", sc.Net.Config().NodeBinary, args); err != nil {
+					return fmt.Errorf("failed to dump database: %w", err)
 				}
-			}*/
 
-			// Reset all the state back to the vanilla state.
-			if err := sc.ResetConsensusState(childEnv); err != nil {
-				return fmt.Errorf("scenario/e2e/dump_restore: failed to clean tendemint storage: %w", err)
+				// Load the dumped state.
+				fp, err := genesisFile.NewFileProvider(dbDumpPath)
+				if err != nil {
+					return fmt.Errorf("failed to instantiate file provider (db): %w", err)
+				}
+				dbDoc, err := fp.GetGenesisDocument()
+				if err != nil {
+					return fmt.Errorf("failed to get genesis doc (dump): %w", err)
+				}
+
+				// Compare the two documents for approximate equality.  Note: Certain
+				// fields will be different, so those are fixed up before the comparison.
+				dbDoc.EpochTime.Base = exportedDoc.EpochTime.Base
+				dbDoc.Time = exportedDoc.Time
+				dbRaw, err := json.Marshal(dbDoc)
+				if err != nil {
+					return fmt.Errorf("failed to marshal fixed up dump: %w", err)
+				}
+				expRaw, err := json.Marshal(exportedDoc)
+				if err != nil {
+					return fmt.Errorf("failed to re-marshal export doc: %w", err)
+				}
+				if !bytes.Equal(expRaw, dbRaw) {
+					//return fmt.Errorf("dump does not match state export")
+					sc.Logger.Error("dump does not match state export (ignored)")
+					//return nil
+				}
+
+				/*if len(sc.Net.StorageWorkers()) > 0 {
+					// Dump storage.
+					args = []string{
+						"debug", "storage", "export",
+						"--genesis.file", dumpPath,
+						"--datadir", sc.Net.StorageWorkers()[0].DataDir(),
+						"--storage.export.dir", filepath.Join(childEnv.Dir(), "storage_dumps"),
+						"--debug.dont_blame_oasis",
+						"--debug.allow_test_keys",
+					}
+					if err := cli.RunSubCommand(childEnv, sc.Logger, "storage-dump", sc.Net.Config().NodeBinary, args); err != nil {
+						return fmt.Errorf("scenario/e2e/dump_restore: failed to dump storage: %w", err)
+					}
+				}*/
+
+				// Reset all the state back to the vanilla state.
+				if err := sc.ResetConsensusState(childEnv); err != nil {
+					return fmt.Errorf("scenario/e2e/dump_restore: failed to clean tendemint storage: %w", err)
+				}
+				sc.Logger.Info("dump finished, all seems to have gone well")
+				return nil
+			}()
+			if err != nil {
+				sc.Logger.Error(fmt.Sprintf("error while dumping state: %v", err))
 			}
-			sc.Logger.Info("dump finished, all seems to have gone well")
-			return nil
-		}()
-		if err != nil {
-			sc.Logger.Error(fmt.Sprintf("error while dumping state: %v", err))
-		}
-	})
+		})
+	}
 
 	if err = sc.Net.CheckLogWatchers(); err != nil {
 		return err
